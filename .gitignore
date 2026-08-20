@@ -12,6 +12,7 @@ __pycache__/
 # Downloads
 downloads/
 output/
+data/
 
 # Logs
 *.log
