@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import os
+import random
 from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 
@@ -28,6 +30,15 @@ MAX_NO_NEW_COMMENT = 5
 # 最大评论数量
 # None = 不限制
 MAX_COMMENTS = None
+
+# 是否对评论中的用户信息做脱敏处理
+# True: user_id / nickname 会被替换为哈希值，仅用于去重和统计
+# False: 保留原始信息
+ANONYMIZE_USERS = False
+
+# 滚动等待时间的随机抖动范围（秒）
+# 实际等待 = SCROLL_WAIT + random.uniform(-SCROLL_JITTER, SCROLL_JITTER)
+SCROLL_JITTER = 0.8
 
 # 登录检测：
 # 未登录时最多等待多少秒
@@ -71,10 +82,30 @@ def get_video_id(video_url):
 
 
 # ============================================================
+# 用户信息脱敏
+# ============================================================
+
+def _anonymize(value):
+    """
+    对用户标识做简单的哈希脱敏。
+    保留可用于去重/统计的一致性，但不再是原始明文。
+    """
+
+    if value is None:
+        return None
+
+    digest = hashlib.sha256(
+        str(value).encode("utf-8")
+    ).hexdigest()
+
+    return digest[:12]
+
+
+# ============================================================
 # 评论解析
 # ============================================================
 
-def parse_comment(comment):
+def parse_comment(comment, anonymize=ANONYMIZE_USERS):
     """
     从抖音评论 JSON 中提取需要的数据。
 
@@ -130,18 +161,21 @@ def parse_comment(comment):
 
             create_time = None
 
+    user_id = user.get("uid")
+    nickname = user.get("nickname")
+
+    if anonymize:
+        user_id = _anonymize(user_id)
+        nickname = _anonymize(nickname)
+
     return {
         "comment_id": comment.get(
             "cid"
         ),
 
-        "user_id": user.get(
-            "uid"
-        ),
+        "user_id": user_id,
 
-        "nickname": user.get(
-            "nickname"
-        ),
+        "nickname": nickname,
 
         "text": comment.get(
             "text"
@@ -215,7 +249,8 @@ class DouyinCommentCapturer:
     def __init__(
         self,
         video_url,
-        max_comments=MAX_COMMENTS
+        max_comments=MAX_COMMENTS,
+        anonymize=ANONYMIZE_USERS
     ):
 
         self.video_url = video_url
@@ -227,6 +262,8 @@ class DouyinCommentCapturer:
         self.max_comments = (
             max_comments
         )
+
+        self.anonymize = anonymize
 
         # ----------------------------------------------------
         # 评论
@@ -569,7 +606,8 @@ class DouyinCommentCapturer:
         for comment in page_comments:
 
             parsed = parse_comment(
-                comment
+                comment,
+                anonymize=self.anonymize
             )
 
             comment_id = parsed[
@@ -707,10 +745,15 @@ class DouyinCommentCapturer:
             # 等待评论接口
             # ------------------------------------------------
 
-            await self.page.wait_for_timeout(
-                int(
-                    SCROLL_WAIT * 1000
+            wait_seconds = max(
+                0.5,
+                SCROLL_WAIT + random.uniform(
+                    -SCROLL_JITTER, SCROLL_JITTER
                 )
+            )
+
+            await self.page.wait_for_timeout(
+                int(wait_seconds * 1000)
             )
 
             # ------------------------------------------------
@@ -979,7 +1022,8 @@ class DouyinCommentCapturer:
 
 async def capture_comments(
     video_url,
-    max_comments=MAX_COMMENTS
+    max_comments=MAX_COMMENTS,
+    anonymize=ANONYMIZE_USERS
 ):
     """
     采集抖音视频评论。
@@ -993,6 +1037,11 @@ async def capture_comments(
             最大评论数量。
             None 表示不限制。
 
+        anonymize:
+            是否对评论作者的 user_id / nickname 做哈希脱敏。
+            默认为 False（保留原始信息，便于个人本地使用）。
+            如果计划保存/分享抓取结果，建议设为 True。
+
     返回：
 
         评论列表
@@ -1001,7 +1050,8 @@ async def capture_comments(
     capturer = (
         DouyinCommentCapturer(
             video_url,
-            max_comments=max_comments
+            max_comments=max_comments,
+            anonymize=anonymize
         )
     )
 
