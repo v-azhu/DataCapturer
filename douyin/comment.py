@@ -9,6 +9,8 @@ from datetime import datetime, timezone, timedelta
 
 from playwright.async_api import async_playwright
 
+from .utils import extract_douyin_url, resolve_share_url
+
 
 # ============================================================
 # 配置
@@ -1020,6 +1022,27 @@ class DouyinCommentCapturer:
 # 对外接口
 # ============================================================
 
+def _resolve_video_url(share_text_or_url: str) -> str:
+    """
+    把用户输入的内容（可能是完整分享文案、短链接，
+    或者已经是干净的视频 URL）统一解析成
+    一个可以直接 page.goto() 的 douyin.com 视频 URL。
+    """
+
+    url = extract_douyin_url(share_text_or_url)
+
+    if not url:
+        raise ValueError(
+            "没有在输入内容中找到有效的抖音链接: "
+            f"{share_text_or_url!r}"
+        )
+
+    # 短链接需要跟随跳转拿到真实地址；
+    # 如果本身已经是 douyin.com/video/xxx，
+    # resolve_share_url 也会直接原样返回。
+    return resolve_share_url(url)
+
+
 async def capture_comments(
     video_url,
     max_comments=MAX_COMMENTS,
@@ -1031,7 +1054,8 @@ async def capture_comments(
     参数：
 
         video_url:
-            抖音视频 URL
+            抖音视频链接、短链接，或者包含链接的完整分享文案
+            （函数内部会自动提取并解析出真实视频 URL）。
 
         max_comments:
             最大评论数量。
@@ -1047,9 +1071,11 @@ async def capture_comments(
         评论列表
     """
 
+    resolved_url = _resolve_video_url(video_url)
+
     capturer = (
         DouyinCommentCapturer(
-            video_url,
+            resolved_url,
             max_comments=max_comments,
             anonymize=anonymize
         )
