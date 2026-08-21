@@ -4,15 +4,16 @@ Bilibili downloader.
 Supports:
 - video mode: download only the video represented by the URL
 - playlist mode: download selected playlist items lazily
+- playlist ranges: "1-3", "5", "3-", "-3"
 - no MP3 conversion
 """
-
 from __future__ import annotations
 
 import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
 
@@ -26,14 +27,17 @@ def _safe_filename(name: str) -> str:
     if not name:
         return "unknown"
 
-    # Windows forbidden characters.
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     name = name.rstrip(" .")
     return name or "unknown"
 
 
-def _build_ydl_opts(output_template: str, *, no_playlist: bool = False,
-                    extract_flat: bool = False) -> dict[str, Any]:
+def _build_ydl_opts(
+    output_template: str,
+    *,
+    no_playlist: bool = False,
+    extract_flat: bool = False,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "outtmpl": output_template,
         "format": "bestvideo+bestaudio/best",
@@ -49,45 +53,105 @@ def _build_ydl_opts(output_template: str, *, no_playlist: bool = False,
     return opts
 
 
-def _get_info(url: str, *, no_playlist: bool, extract_flat: bool = False) -> dict[str, Any]:
-    """
-    Extract metadata without downloading.
-
-    In playlist mode extract_flat=True prevents yt-dlp from opening every
-    playlist entry just to collect metadata.
-    """
+def _get_info(
+    url: str,
+    *,
+    no_playlist: bool,
+    extract_flat: bool = False,
+) -> dict[str, Any] | None:
+    """Extract metadata without downloading."""
     opts = _build_ydl_opts(
         "%(title)s.%(ext)s",
         no_playlist=no_playlist,
         extract_flat=extract_flat,
     )
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
-def _entry_url(entry: dict[str, Any]) -> str | None:
-    """Return a directly usable URL for a flat playlist entry."""
-    url = entry.get("webpage_url") or entry.get("original_url")
-    if url:
-        return url
+def _build_part_url(url: str, part_number: int) -> str:
+    """
+    Build a Bilibili anthology URL for one specific p=N item.
 
-    url = entry.get("url")
-    if not url:
-        return None
+    Existing query parameters are preserved, while p is replaced.
+    """
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
 
-    # Bilibili flat entries commonly provide the BV id as url.
-    if str(url).startswith(("BV", "av")):
-        return f"https://www.bilibili.com/video/{url}"
+    # Remove an existing p parameter and replace it with the requested one.
+    query = [(key, value) for key, value in query if key.lower() != "p"]
+    query.append(("p", str(part_number)))
 
-    return str(url)
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(query),
+            parts.fragment,
+        )
+    )
 
 
-def _entry_title(entry: dict[str, Any], fallback_index: int) -> str:
-    title = entry.get("title")
-    if title:
-        return str(title)
+def _parse_playlist_items(value: str | None) -> tuple[str, int | None, int | None]:
+    """
+    Parse the supported playlist range forms.
 
-    return f"unknown_{fallback_index}"
+    Returns:
+        ("fixed", start, end)
+        ("open_end", start, None)
+
+    Supported:
+        None / "" -> all, represented as open_end from 1
+        "5"       -> item 5 only
+        "1-3"     -> items 1 through 3
+        "-3"      -> items 1 through 3
+        "3-"      -> item 3 through the end
+
+    A comma-separated selector is deliberately not handled here; the
+    current downloader's lazy model is based on one contiguous range.
+    """
+    if value is None or not value.strip():
+        return "open_end", 1, None
+
+    text = value.strip()
+
+    if re.fullmatch(r"\d+", text):
+        number = int(text)
+        if number < 1:
+            raise ValueError("playlist_items 中的集数必须 >= 1")
+        return "fixed", number, number
+
+    match = re.fullmatch(r"(\d*)\s*-\s*(\d*)", text)
+    if not match:
+        raise ValueError(
+            "playlist_items 只支持：'5'、'1-3'、'-3'、'3-'"
+        )
+
+    left, right = match.groups()
+
+    if not left and not right:
+        raise ValueError("playlist_items 范围不能为空")
+
+    if not left:
+        end = int(right)
+        if end < 1:
+            raise ValueError("playlist_items 中的集数必须 >= 1")
+        return "fixed", 1, end
+
+    start = int(left)
+    if start < 1:
+        raise ValueError("playlist_items 中的集数必须 >= 1")
+
+    if not right:
+        return "open_end", start, None
+
+    end = int(right)
+    if end < start:
+        raise ValueError("playlist_items 的结束集数不能小于开始集数")
+
+    return "fixed", start, end
 
 
 def _download_single(url: str, output_path: Path) -> Path | None:
@@ -98,7 +162,6 @@ def _download_single(url: str, output_path: Path) -> Path | None:
         print(f"已存在: {output_path}")
         return output_path
 
-    # %(ext)s is replaced by yt-dlp; merge_output_format ensures mp4.
     stem = str(output_path.with_suffix(""))
     opts = _build_ydl_opts(
         stem + ".%(ext)s",
@@ -117,10 +180,10 @@ def _download_single(url: str, output_path: Path) -> Path | None:
     if output_path.exists():
         return output_path
 
-    # Some yt-dlp versions may choose another final extension.
     candidates = list(output_path.parent.glob(output_path.stem + ".*"))
     candidates = [
-        p for p in candidates
+        p
+        for p in candidates
         if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
     ]
     if candidates:
@@ -144,6 +207,39 @@ def download_video(
     return str(result) if result else None
 
 
+def _resolve_playlist_item(
+    url: str,
+    part_number: int,
+) -> tuple[str, dict[str, Any]] | None:
+    """
+    Resolve exactly one playlist item.
+
+    No parent playlist extraction is performed. The p=N URL is resolved
+    directly with noplaylist=True.
+    """
+    item_url = _build_part_url(url, part_number)
+
+    print(f"\n解析第 {part_number} 集...")
+    print("正在解析B站页面...")
+
+    try:
+        info = _get_info(
+            item_url,
+            no_playlist=True,
+            extract_flat=False,
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(f"获取第 {part_number} 集信息失败: {exc}")
+        return None
+
+    if not info:
+        return None
+
+    return item_url, info
+
+
 def download_videos(
     url: str,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
@@ -158,20 +254,27 @@ def download_videos(
     ----------
     url:
         Bilibili video/playlist URL.
+
     output_dir:
         Destination directory.
+
     mode:
         "video"    -> current video only
         "playlist" -> selected playlist entries
+
     playlist_items:
-        yt-dlp playlist selector, e.g. "1-3", "5", "1,3,5".
-        None means the entire playlist.
+        Supported lazy selectors:
+            "1-3" -> items 1 through 3
+            "5"   -> item 5
+            "-3"  -> items 1 through 3
+            "3-"  -> item 3 through the end
+
+        None / "" means the entire playlist, starting from item 1 and
+        continuing until the first unavailable item.
 
     Important:
-        playlist mode uses extract_flat=True during the initial extraction.
-        This means yt-dlp does NOT fully parse all playlist entries.
-        Detailed metadata is fetched only for entries that are actually
-        selected for download.
+        Playlist mode NEVER calls extract_info() on the parent playlist.
+        Every requested p=N item is resolved independently.
     """
     if mode not in {"video", "playlist"}:
         raise ValueError("mode 必须是 'video' 或 'playlist'")
@@ -179,10 +282,25 @@ def download_videos(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("正在解析B站页面...")
-
+    # ------------------------------------------------------------------
+    # video mode
+    # ------------------------------------------------------------------
     if mode == "video":
-        info = _get_info(url, no_playlist=True, extract_flat=False)
+        print("正在解析B站页面...")
+        info = _get_info(
+            url,
+            no_playlist=True,
+            extract_flat=False,
+        )
+
+        if not info:
+            return {
+                "success": False,
+                "count": 1,
+                "downloaded": 0,
+                "failed": 1,
+                "files": [],
+            }
 
         title = info.get("title") or "unknown_1"
         print("\n下载模式: video")
@@ -192,7 +310,7 @@ def download_videos(
         print("处理: 1")
         print(title)
 
-        filename = f"01_{_safe_filename(title)}.mp4"
+        filename = f"01_{_safe_filename(str(title))}.mp4"
         output_path = output_dir / filename
 
         print(f"\n下载: {filename}")
@@ -216,80 +334,92 @@ def download_videos(
             "files": [],
         }
 
-    # playlist mode ---------------------------------------------------------
-    # The initial extraction is flat. This is the key to avoiding the
-    # previous "parse all 73 videos first" behavior.
-    opts = _build_ydl_opts(
-        "%(title)s.%(ext)s",
-        no_playlist=False,
-        extract_flat=True,
-    )
-    if playlist_items:
-        opts["playlist_items"] = playlist_items
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        playlist_info = ydl.extract_info(url, download=False)
-
-    entries = [
-        e for e in (playlist_info.get("entries") or [])
-        if e
-    ]
+    # ------------------------------------------------------------------
+    # playlist mode
+    # ------------------------------------------------------------------
+    selector_type, start, end = _parse_playlist_items(playlist_items)
 
     print(f"\n下载模式: playlist")
     if playlist_items:
         print(f"下载范围: {playlist_items}")
     else:
         print("下载范围: 全部")
-    print(f"视频数量: {len(entries)}")
+    if selector_type == "fixed":
+        assert start is not None
+        assert end is not None
+        print(f"视频数量: {end - start + 1}")
+    else:
+        print("视频数量: 从开始集数逐集解析")
 
     downloaded_files: list[str] = []
     failed = 0
+    attempted = 0
 
-    for index, entry in enumerate(entries, start=1):
-        # IMPORTANT:
-        # The flat entry normally has no full title. Resolve metadata NOW,
-        # one selected video at a time. We do not touch unselected entries.
-        entry_url = _entry_url(entry)
-        if not entry_url:
-            print(f"\n处理: {index}")
-            print("无法确定视频URL")
+    assert start is not None
+    current = start
+
+    while True:
+        if selector_type == "fixed":
+            assert end is not None
+            if current > end:
+                break
+
+        resolved = _resolve_playlist_item(url, current)
+
+        # For open-ended ranges, the first unavailable item marks the end
+        # of the playlist. For a fixed range, it is a real failure.
+        if resolved is None:
+            if selector_type == "open_end":
+                print(f"\n第 {current} 集不存在或无法解析，结束 playlist。")
+                break
+
+            print("\n" + "=" * 60)
+            print(f"处理: {current}")
+            print(f"第 {current} 集无法解析")
             failed += 1
+            attempted += 1
+            current += 1
             continue
 
+        item_url, detail = resolved
+        attempted += 1
+
         print("\n" + "=" * 60)
-        print(f"处理: {index}")
+        print(f"处理: {current}")
 
-        # Fetch full metadata only for this selected entry.
-        try:
-            detail = _get_info(
-                entry_url,
-                no_playlist=True,
-                extract_flat=False,
-            )
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            print(f"获取视频信息失败: {exc}")
-            detail = entry
-
-        title = _entry_title(detail, index)
+        title = detail.get("title") or f"unknown_{current}"
+        title = str(title)
         print(title)
 
-        filename = f"{index:02d}_{_safe_filename(title)}.mp4"
+        filename = f"{current:02d}_{_safe_filename(title)}.mp4"
         output_path = output_dir / filename
 
         print(f"\n下载: {filename}")
-        result = _download_single(entry_url, output_path)
+        result = _download_single(item_url, output_path)
 
         if result:
             print(f"完成: {result}")
-            downloaded_files.append(str(result).replace("/", os.sep))
+            downloaded_files.append(
+                str(result).replace("/", os.sep)
+            )
         else:
             failed += 1
 
+        current += 1
+
+    # A playlist ending naturally with zero successful items is not a
+    # successful download operation.
+    success = failed == 0 and len(downloaded_files) > 0
+
+    print("\n" + "=" * 60)
+    print("下载完成")
+    print("总数:", attempted)
+    print("成功:", len(downloaded_files))
+    print("失败:", failed)
+
     return {
-        "success": failed == 0,
-        "count": len(entries),
+        "success": success,
+        "count": attempted,
         "downloaded": len(downloaded_files),
         "failed": failed,
         "files": downloaded_files,
