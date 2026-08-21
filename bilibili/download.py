@@ -1,550 +1,296 @@
+"""
+Bilibili downloader.
+
+Supports:
+- video mode: download only the video represented by the URL
+- playlist mode: download selected playlist items lazily
+- no MP3 conversion
+"""
+
+from __future__ import annotations
+
 import os
+import re
+from pathlib import Path
+from typing import Any
 
 import yt_dlp
 
 
-# ============================================================
-# 配置
-# ============================================================
-
-DEFAULT_OUTPUT_DIR = "data/bilibili"
-
-# 下载模式
-#
-# video:
-#     只下载 URL 当前指向的视频
-#
-# playlist:
-#     下载 URL 所在合集的全部视频
-#
-DEFAULT_DOWNLOAD_MODE = "video"
+DEFAULT_OUTPUT_DIR = Path("data/bilibili")
 
 
-# ============================================================
-# 工具函数
-# ============================================================
+def _safe_filename(name: str) -> str:
+    """Make a Windows-safe filename while preserving Chinese text."""
+    name = (name or "").strip()
+    if not name:
+        return "unknown"
 
-def clean_filename(name):
-    """
-    清理 Windows 文件名中的非法字符。
-    """
-
-    bad = '\\/:*?"<>|'
-
-    for char in bad:
-        name = name.replace(char, "_")
-
-    return name.strip()
+    # Windows forbidden characters.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = name.rstrip(" .")
+    return name or "unknown"
 
 
-# ============================================================
-# 获取视频信息
-# ============================================================
-
-def get_video_info(url, download_mode="video"):
-    """
-    获取 B 站视频信息。
-
-    download_mode:
-        video:
-            只获取当前视频
-
-        playlist:
-            获取当前视频所在合集的全部视频
-    """
-
-    if download_mode not in ("video", "playlist"):
-        raise ValueError(
-            f"不支持的 download_mode: {download_mode}"
-        )
-
-    print("正在解析B站页面...")
-
-    opts = {
-        "extract_flat": False,
+def _build_ydl_opts(output_template: str, *, no_playlist: bool = False,
+                    extract_flat: bool = False) -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "outtmpl": output_template,
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "noplaylist": no_playlist,
         "quiet": False,
-        "ignoreerrors": True,
+        "no_warnings": False,
     }
 
-    # --------------------------------------------------------
-    # video 模式
-    #
-    # 不主动展开合集，只处理当前 URL 对应的视频。
-    # --------------------------------------------------------
+    if extract_flat:
+        opts["extract_flat"] = True
 
-    if download_mode == "video":
+    return opts
 
-        opts["noplaylist"] = True
 
-    # --------------------------------------------------------
-    # playlist 模式
-    #
-    # 允许 yt-dlp 获取当前 URL 所在合集。
-    # --------------------------------------------------------
+def _get_info(url: str, *, no_playlist: bool, extract_flat: bool = False) -> dict[str, Any]:
+    """
+    Extract metadata without downloading.
 
-    else:
-
-        opts["noplaylist"] = False
-
+    In playlist mode extract_flat=True prevents yt-dlp from opening every
+    playlist entry just to collect metadata.
+    """
+    opts = _build_ydl_opts(
+        "%(title)s.%(ext)s",
+        no_playlist=no_playlist,
+        extract_flat=extract_flat,
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
-
-        info = ydl.extract_info(
-            url,
-            download=False
-        )
-
-    return info
+        return ydl.extract_info(url, download=False)
 
 
-# ============================================================
-# 获取待下载视频列表
-# ============================================================
-
-def get_entries(info, download_mode="video"):
-    """
-    根据 download_mode 将解析结果转换成统一的视频列表。
-    """
-
-    if not info:
-        return []
-
-    # --------------------------------------------------------
-    # 单视频
-    # --------------------------------------------------------
-
-    if download_mode == "video":
-
-        return [info]
-
-    # --------------------------------------------------------
-    # 合集
-    # --------------------------------------------------------
-
-    entries = info.get("entries")
-
-    if not entries:
-
-        return [info]
-
-    return [
-        entry
-        for entry in entries
-        if entry
-    ]
-
-
-# ============================================================
-# 获取视频 URL
-# ============================================================
-
-def get_video_url(video_info):
-    """
-    从 yt-dlp 返回的信息中获取实际网页 URL。
-    """
-
-    url = video_info.get("webpage_url")
-
+def _entry_url(entry: dict[str, Any]) -> str | None:
+    """Return a directly usable URL for a flat playlist entry."""
+    url = entry.get("webpage_url") or entry.get("original_url")
     if url:
         return url
 
-    url = video_info.get("original_url")
-
-    if url:
-        return url
-
-    url = video_info.get("url")
-
+    url = entry.get("url")
     if not url:
         return None
 
-    # --------------------------------------------------------
-    # 某些情况下 yt-dlp 返回 BV 号
-    # --------------------------------------------------------
+    # Bilibili flat entries commonly provide the BV id as url.
+    if str(url).startswith(("BV", "av")):
+        return f"https://www.bilibili.com/video/{url}"
 
-    if not url.startswith("http"):
-
-        return (
-            "https://www.bilibili.com/video/"
-            + url
-        )
-
-    return url
+    return str(url)
 
 
-# ============================================================
-# 下载单个视频
-# ============================================================
+def _entry_title(entry: dict[str, Any], fallback_index: int) -> str:
+    title = entry.get("title")
+    if title:
+        return str(title)
+
+    return f"unknown_{fallback_index}"
+
+
+def _download_single(url: str, output_path: Path) -> Path | None:
+    """Download exactly one video to output_path."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_path.exists():
+        print(f"已存在: {output_path}")
+        return output_path
+
+    # %(ext)s is replaced by yt-dlp; merge_output_format ensures mp4.
+    stem = str(output_path.with_suffix(""))
+    opts = _build_ydl_opts(
+        stem + ".%(ext)s",
+        no_playlist=True,
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(f"下载失败: {exc}")
+        return None
+
+    if output_path.exists():
+        return output_path
+
+    # Some yt-dlp versions may choose another final extension.
+    candidates = list(output_path.parent.glob(output_path.stem + ".*"))
+    candidates = [
+        p for p in candidates
+        if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+    ]
+    if candidates:
+        return candidates[0]
+
+    return None
+
 
 def download_video(
-    url,
-    filename,
-    output_dir=DEFAULT_OUTPUT_DIR
-):
+    url: str,
+    output_path: str | Path,
+) -> str | None:
     """
-    下载单个 B 站视频。
+    Download one Bilibili video.
 
-    返回：
-        成功：MP4 文件路径
-        失败：None
+    The URL is forced into video mode so a multi-part Bilibili anthology
+    does not accidentally download the entire playlist.
     """
+    path = Path(output_path)
+    result = _download_single(url, path)
+    return str(result) if result else None
 
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
-
-    mp4 = os.path.join(
-        output_dir,
-        filename + ".mp4"
-    )
-
-    # --------------------------------------------------------
-    # 已经存在
-    # --------------------------------------------------------
-
-    if os.path.exists(mp4):
-
-        print(
-            "已存在:",
-            mp4
-        )
-
-        return mp4
-
-    print()
-    print(
-        "下载:",
-        filename
-    )
-
-    opts = {
-        "outtmpl": mp4,
-
-        # 最佳音视频
-        "format": "bestvideo+bestaudio/best",
-
-        # 合并为 MP4
-        "merge_output_format": "mp4",
-
-        # 单个视频失败时不要让 yt-dlp 继续
-        # 把错误吞掉，我们自己处理异常。
-        "ignoreerrors": False,
-    }
-
-    try:
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-
-            result = ydl.download(
-                [url]
-            )
-
-    except Exception as exc:
-
-        print()
-        print(
-            "下载失败:",
-            exc
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # yt-dlp 返回非 0
-    # --------------------------------------------------------
-
-    if result not in (None, 0):
-
-        print()
-        print(
-            "下载失败，yt-dlp 返回码:",
-            result
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # 最终确认文件存在
-    # --------------------------------------------------------
-
-    if not os.path.exists(mp4):
-
-        print()
-        print(
-            "下载完成，但没有找到输出文件:",
-            mp4
-        )
-
-        return None
-
-    print(
-        "完成:",
-        mp4
-    )
-
-    return mp4
-
-
-# ============================================================
-# 批量下载
-# ============================================================
 
 def download_videos(
-    url,
-    download_mode=DEFAULT_DOWNLOAD_MODE,
-    output_dir=DEFAULT_OUTPUT_DIR
-):
+    url: str,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    *,
+    mode: str = "video",
+    playlist_items: str | None = None,
+) -> dict[str, Any]:
     """
-    下载 B 站视频。
+    Download Bilibili video(s).
 
-    参数：
+    Parameters
+    ----------
+    url:
+        Bilibili video/playlist URL.
+    output_dir:
+        Destination directory.
+    mode:
+        "video"    -> current video only
+        "playlist" -> selected playlist entries
+    playlist_items:
+        yt-dlp playlist selector, e.g. "1-3", "5", "1,3,5".
+        None means the entire playlist.
 
-        url:
-            B站视频 URL / 合集 URL
+    Important:
+        playlist mode uses extract_flat=True during the initial extraction.
+        This means yt-dlp does NOT fully parse all playlist entries.
+        Detailed metadata is fetched only for entries that are actually
+        selected for download.
+    """
+    if mode not in {"video", "playlist"}:
+        raise ValueError("mode 必须是 'video' 或 'playlist'")
 
-        download_mode:
-            "video"
-                只下载当前视频
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-            "playlist"
-                下载整个合集
+    print("正在解析B站页面...")
 
-        output_dir:
-            输出目录
+    if mode == "video":
+        info = _get_info(url, no_playlist=True, extract_flat=False)
 
-    返回：
+        title = info.get("title") or "unknown_1"
+        print("\n下载模式: video")
+        print("视频数量: 1")
 
-        {
-            "success": True/False,
-            "count": 总视频数,
-            "downloaded": 成功数量,
-            "failed": 失败数量,
-            "files": [...]
+        print("\n" + "=" * 60)
+        print("处理: 1")
+        print(title)
+
+        filename = f"01_{_safe_filename(title)}.mp4"
+        output_path = output_dir / filename
+
+        print(f"\n下载: {filename}")
+        result = _download_single(url, output_path)
+
+        if result:
+            print(f"完成: {result}")
+            return {
+                "success": True,
+                "count": 1,
+                "downloaded": 1,
+                "failed": 0,
+                "files": [str(result).replace("/", os.sep)],
+            }
+
+        return {
+            "success": False,
+            "count": 1,
+            "downloaded": 0,
+            "failed": 1,
+            "files": [],
         }
-    """
 
-    if download_mode not in (
-        "video",
-        "playlist"
-    ):
-
-        raise ValueError(
-            "download_mode 必须是 "
-            "'video' 或 'playlist'"
-        )
-
-    # --------------------------------------------------------
-    # 初始化结果
-    # --------------------------------------------------------
-
-    result = {
-        "success": False,
-        "count": 0,
-        "downloaded": 0,
-        "failed": 0,
-        "files": [],
-    }
-
-    # --------------------------------------------------------
-    # 解析
-    # --------------------------------------------------------
-
-    try:
-
-        info = get_video_info(
-            url,
-            download_mode=download_mode
-        )
-
-    except Exception as exc:
-
-        print()
-        print(
-            "无法获取视频信息:",
-            exc
-        )
-
-        result["failed"] = 1
-
-        return result
-
-    if not info:
-
-        print()
-        print(
-            "无法获取视频信息"
-        )
-
-        result["failed"] = 1
-
-        return result
-
-    # --------------------------------------------------------
-    # 获取视频列表
-    # --------------------------------------------------------
-
-    entries = get_entries(
-        info,
-        download_mode=download_mode
+    # playlist mode ---------------------------------------------------------
+    # The initial extraction is flat. This is the key to avoiding the
+    # previous "parse all 73 videos first" behavior.
+    opts = _build_ydl_opts(
+        "%(title)s.%(ext)s",
+        no_playlist=False,
+        extract_flat=True,
     )
+    if playlist_items:
+        opts["playlist_items"] = playlist_items
 
-    if not entries:
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        playlist_info = ydl.extract_info(url, download=False)
 
-        print()
-        print(
-            "没有找到可下载的视频"
-        )
+    entries = [
+        e for e in (playlist_info.get("entries") or [])
+        if e
+    ]
 
-        result["failed"] = 1
+    print(f"\n下载模式: playlist")
+    if playlist_items:
+        print(f"下载范围: {playlist_items}")
+    else:
+        print("下载范围: 全部")
+    print(f"视频数量: {len(entries)}")
 
-        return result
+    downloaded_files: list[str] = []
+    failed = 0
 
-    result["count"] = len(entries)
-
-    print()
-    print(
-        "下载模式:",
-        download_mode
-    )
-
-    print(
-        "视频数量:",
-        len(entries)
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # 逐个下载
-    # --------------------------------------------------------
-
-    for index, video in enumerate(
-        entries,
-        1
-    ):
-
-        print()
-        print(
-            "=" * 60
-        )
-
-        print(
-            "处理:",
-            index
-        )
-
-        # ----------------------------------------------------
-        # 标题
-        # ----------------------------------------------------
-
-        title = video.get(
-            "title",
-            f"unknown_{index}"
-        )
-
-        title = clean_filename(
-            title
-        )
-
-        print(
-            title
-        )
-
-        # ----------------------------------------------------
-        # URL
-        # ----------------------------------------------------
-
-        video_url = get_video_url(
-            video
-        )
-
-        if not video_url:
-
-            print(
-                "无URL，跳过"
-            )
-
-            result["failed"] += 1
-
+    for index, entry in enumerate(entries, start=1):
+        # IMPORTANT:
+        # The flat entry normally has no full title. Resolve metadata NOW,
+        # one selected video at a time. We do not touch unselected entries.
+        entry_url = _entry_url(entry)
+        if not entry_url:
+            print(f"\n处理: {index}")
+            print("无法确定视频URL")
+            failed += 1
             continue
 
-        # ----------------------------------------------------
-        # 文件名
-        # ----------------------------------------------------
+        print("\n" + "=" * 60)
+        print(f"处理: {index}")
 
-        filename = (
-            f"{index:02d}_{title}"
-        )
-
-        # ----------------------------------------------------
-        # 下载
-        # ----------------------------------------------------
-
+        # Fetch full metadata only for this selected entry.
         try:
-
-            mp4 = download_video(
-                video_url,
-                filename,
-                output_dir=output_dir
+            detail = _get_info(
+                entry_url,
+                no_playlist=True,
+                extract_flat=False,
             )
-
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:
+            print(f"获取视频信息失败: {exc}")
+            detail = entry
 
-            print()
-            print(
-                "处理失败:",
-                exc
-            )
+        title = _entry_title(detail, index)
+        print(title)
 
-            mp4 = None
+        filename = f"{index:02d}_{_safe_filename(title)}.mp4"
+        output_path = output_dir / filename
 
-        # ----------------------------------------------------
-        # 判断结果
-        # ----------------------------------------------------
+        print(f"\n下载: {filename}")
+        result = _download_single(entry_url, output_path)
 
-        if mp4:
-
-            result["downloaded"] += 1
-
-            result["files"].append(
-                mp4
-            )
-
+        if result:
+            print(f"完成: {result}")
+            downloaded_files.append(str(result).replace("/", os.sep))
         else:
+            failed += 1
 
-            result["failed"] += 1
-
-    # --------------------------------------------------------
-    # 最终状态
-    # --------------------------------------------------------
-
-    result["success"] = (
-        result["failed"] == 0
-        and result["downloaded"] > 0
-    )
-
-    print()
-    print(
-        "=" * 60
-    )
-
-    print(
-        "下载完成"
-    )
-
-    print(
-        "总数:",
-        result["count"]
-    )
-
-    print(
-        "成功:",
-        result["downloaded"]
-    )
-
-    print(
-        "失败:",
-        result["failed"]
-    )
-
-    return result
+    return {
+        "success": failed == 0,
+        "count": len(entries),
+        "downloaded": len(downloaded_files),
+        "failed": failed,
+        "files": downloaded_files,
+    }
